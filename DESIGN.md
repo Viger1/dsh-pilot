@@ -28,15 +28,19 @@
 
 ## 3. 权限模型（本插件的核心卖点）
 
-现有竞品全是"裸奔的自动化脚本"。dsh-pilot 原生接入 dsh 的审批缝：
+现有竞品全是"裸奔的自动化脚本"。dsh-pilot **不发明第二套权限系统**——它读取并跟随 dsh 会话自身的权限旋钮（`sandbox/mode` / `approval/policy` 持久事件，随权限预设在会话创建时固化）。
 
-1. **域名分级**：config 提供 `allowedOrigins`（预授权列表）与 `newOriginPolicy: ask | deny | allow`（默认 `ask`）。
-2. **ask 的实现**：插件自身注册一个 `tools/pre-execute` waterfall 监听器，检查 `pilot_navigate` 的目标 origin——未授权时返回 `{kind: 'ask'}`，由 dsh 自带的 `user-approval` 插件弹给用户（Web UI 里就是标准审批卡片）。同一会话内批准过的 origin 进入会话级缓存，不重复打扰。无审批座席的部署（纯 headless）按 `deny` 落地，宁可失败不可越权。
-3. **敏感动作硬闸**（不可配置关闭）：
-   - 检测到目标是 `input[type=password]` 的 type 操作 → 拒绝，提示用户手动完成登录（与 dsh 凭证不落模型的立场一致）。
-   - upload 只允许工作区内的文件；下载落到工作区指定目录。
+设计前提（已核实官方语义，`packages/interaction/user-approval/README.md`）：审批策略 `never`（`danger-full-access` 预设自带）的含义是**"不弹窗，需审批动作自动拒绝"**。因此域名检查不能无脑走 ask 通道——在全开权限模式下会被自动拒绝，恰好与用户意图相反。
+
+1. **默认 `newOriginPolicy: auto`，跟随 dsh 会话权限**：
+   - 会话为 `danger-full-access`（审批 `never`）→ 任何 origin **静默放行**。用户已声明全开权限，插件不再设卡。
+   - 会话审批策略为 `ask` 且审批座席在场 → 新 origin 弹标准审批卡（`tools/pre-execute` 返回 `ask`，由 `user-approval` 服务）；同会话批准过的 origin 进入插件级缓存不重复问。
+   - 无审批座席（纯自动化部署）→ 拒绝，与 dsh 自身"审批缺席即失败关闭"一致。
+   - 显式覆盖值 `ask | deny | allow` 供需要固定行为的部署使用。
+2. **`allowedOrigins`**：预授权列表，任何模式下直接放行（省掉已知安全站点的首次询问）。localhost/127.0.0.1 永远放行。
+3. **凭证卫生闸（独立于权限模式）**：向 `input[type=password]` 输入 → 默认拒绝并提示用户手动登录。做成 `allowPasswordFields`（默认 `false`）而**不**随 danger-full-access 自动解除：它保护的是"凭证不进模型上下文/日志"（dsh 全开模式下也保持的立场——write-only key、引用式凭证库），不是动作权限。upload 限工作区文件；下载落 `downloadDir`。
 4. **登录态**：默认每次全新隔离 context（无 cookie）。`profileDir` 配置显式 opt-in 持久化 profile 以操作已登录网站——README 用加粗警告说明这等于把该 profile 的全部登录态交给 agent。
-5. **prompt injection 立场**：内置 skill 明确"页面内容是数据不是指令"；结合 origin 审批 + 密码硬闸 + 上传限制构成纵深。这些护栏写进 README 的 Security model 一节，作为与竞品的核心差异化卖点。
+5. **prompt injection 立场**：内置 skill 明确"页面内容是数据不是指令"；结合 origin 跟随策略 + 凭证闸 + 上传限制构成纵深。这些护栏写进 README 的 Security model 一节，作为与竞品的核心差异化卖点。
 
 ## 4. 内置 skill：`browser-pilot`
 
@@ -57,7 +61,8 @@
     snapshotMaxChars: 24000
     maxTabs: 8
     allowedOrigins: []
-    newOriginPolicy: ask        # ask | deny | allow
+    newOriginPolicy: auto       # auto（跟随 dsh 会话权限）| ask | deny | allow
+    allowPasswordFields: false  # 凭证卫生闸，独立于权限模式
     profileDir: ''              # 空 = 隔离 context；显式路径 = 持久化登录态
     downloadDir: .dsh-pilot/downloads
     screenshotDir: .dsh-pilot
@@ -69,8 +74,9 @@
 - **M1（可发布）**：审批集成（tools/pre-execute + user-approval）、标签页、upload/download、skill、双语 README、审查工作流过一遍、e2e 实测。
 - **M2（差异化拉满）**：与 dsh-preview v1.1 共享的视觉路由（截图→用户配置的视觉模型route），用于 canvas/图表类无 DOM 语义的页面兜底。
 
-## 7. 待评审的开放问题
+## 7. 评审决议（2026-08-16，与维护者讨论定案）
 
-1. `newOriginPolicy` 默认值：`ask`（推荐，Web UI 体验好）还是 `deny`（headless 更安全）？拟按运行环境自适应：有审批座席 ask、无则 deny——是否同意？
-2. 工具名前缀 `pilot_` vs 复用 `browser_`：前缀区分可与 dsh-preview 共存不冲突（推荐 `pilot_`），但模型见到两套浏览器工具可能混用——skill 里写清分工是否足够？
-3. M2 视觉路由是否值得提前到 M1（你的 maya 中转有现成视觉模型）？
+1. **origin 策略**：默认 `auto`，跟随 dsh 会话权限（danger-full-access 静默放行 / ask 弹标准审批卡 / 无座席拒绝）。维护者原则：用户在 dsh 里开了全部权限，插件不得再设卡。凭证卫生闸独立于权限模式，`allowPasswordFields` 可显式关闭。
+2. **工具名**：`pilot_` 前缀，与 dsh-preview 共存；分工由各自 skill 说明。
+3. **视觉路由**：维持 M2，不阻塞 M0/M1 发布。
+4. **npm 发布**：与仓库转公开同步进行；scoped 名 `@n0nam2/*` 作为名字被抢时的兜底。
