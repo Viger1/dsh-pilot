@@ -2,7 +2,14 @@
 
 **Hands for your DeepSeek Harness agent — autonomous browser operation with a native permission model.**
 
-Sibling of [dsh-preview](https://github.com/Viger1/dsh-preview) (the eyes). Status: **design review** — see [DESIGN.md](DESIGN.md). Implementation starts after the design is approved.
+Sibling of [dsh-preview](https://github.com/Viger1/dsh-preview) (the eyes). Status: **M0 complete** — aria-ref snapshot/act mechanism, six tools, network-layer origin fence, popup containment, password guard, bundled skill; see [DESIGN.md](DESIGN.md) for the reviewed design and milestones.
+
+## Family
+
+| Plugin | What it gives your agent |
+| --- | --- |
+| [dsh-preview](https://github.com/Viger1/dsh-preview) | 👁 Eyes — verify what it builds: open, read, screenshot, self-check |
+| **dsh-pilot** (this repo) | ✋ Hands — operate any page by accessibility refs, with a network-layer origin fence |
 
 ## Planned surface
 
