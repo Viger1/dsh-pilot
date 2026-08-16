@@ -109,8 +109,9 @@ ref 来自 Playwright 引擎绑定的无障碍快照（`aria-ref` 定位器—�
 | --- | --- |
 | [dsh-preview](https://github.com/Viger1/dsh-preview) | 👁 眼睛——验证自己写的页面：打开、读取、截图、自检 |
 | **dsh-pilot**（本仓库） | ✋ 手——按无障碍 ref 操作任意页面，带原生权限模型 |
+| [dsh-review](https://github.com/Viger1/dsh-review) | 🔍 判断力——找出缺陷，并在报告前逐条尝试推翻它 |
 
-两者独立安装、可共存。设计依据与里程碑见 [DESIGN.md](DESIGN.md)。
+三者均可独立安装、可共存。设计依据与里程碑见 [DESIGN.md](DESIGN.md)。
 
 ## 本地开发
 
