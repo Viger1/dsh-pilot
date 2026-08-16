@@ -11,6 +11,8 @@
  * @module dsh-pilot/engine
  */
 
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { Browser, BrowserContext, Page } from 'playwright-core'
 import { chromium } from 'playwright-core'
 
@@ -35,6 +37,16 @@ export interface RequestFailure {
   reason: string
 }
 
+/** One completed download attempt. */
+export interface DownloadEntry {
+  /** Capture seq, so a tool reports only downloads since its own start. */
+  seq: number
+  /** Saved path on success. */
+  path?: string
+  /** Failure reason on error. */
+  error?: string
+}
+
 /** A tracked tab with its capture buffers and snapshot state. */
 export interface TrackedPage {
   /** Stable id handed to the model (`tab-1`, `tab-2`, ...). */
@@ -47,10 +59,19 @@ export interface TrackedPage {
   failures: RequestFailure[]
   /** Seq of the most recently captured console entry; 0 before the first. */
   lastSeq: number
+  /** Downloads this tab produced, capped like the console buffer. */
+  downloads: DownloadEntry[]
   /** True once a ref-bearing snapshot was taken for this tab. */
   snapshotTaken: boolean
   /** True once the main frame navigated after the latest snapshot. */
   refsStale: boolean
+  /**
+   * Exempts this tab from the origin fence for the rest of its life. Set only
+   * for a navigation authorized under a session that opted out of prompts
+   * (approval policy `never`), so the exemption dies with the tab instead of
+   * becoming a cross-session grant.
+   */
+  unfenced: boolean
 }
 
 /** Launch/viewport options fixed per manager by plugin config. */
@@ -69,6 +90,8 @@ export interface EngineOptions {
   maxTabs: number
   /** Persistent profile directory; empty string = fresh isolated context. */
   profileDir: string
+  /** Absolute directory downloads are saved into. */
+  downloadDir: string
   /**
    * Origin fence: http(s) main-frame navigations whose URL fails this
    * predicate are aborted at the network layer, whatever initiated them.
@@ -87,7 +110,9 @@ export class Engine {
   private persistent: BrowserContext | undefined
   private contextPromise: Promise<BrowserContext> | undefined
   private pages = new Map<string, TrackedPage>()
+  private tracked = new WeakMap<Page, TrackedPage>()
   private counter = 0
+  private downloadCounter = 0
   private lastId: string | undefined
   private disposed = false
 
@@ -110,7 +135,8 @@ export class Engine {
       throw new Error('browser engine is disposed (plugin unloading)')
     }
     const id = `tab-${++this.counter}`
-    const tracked: TrackedPage = { id, page, console: [], failures: [], lastSeq: 0, snapshotTaken: false, refsStale: false }
+    const tracked: TrackedPage = { id, page, console: [], failures: [], lastSeq: 0, downloads: [], snapshotTaken: false, refsStale: false, unfenced: false }
+    this.tracked.set(page, tracked)
     page.on('console', (msg) => this.capture(tracked, msg.type(), msg.text()))
     page.on('pageerror', (err) => this.capture(tracked, 'error', String(err)))
     page.on('requestfailed', (req) => {
@@ -119,6 +145,17 @@ export class Engine {
     })
     page.on('framenavigated', (frame) => {
       if (frame === page.mainFrame()) tracked.refsStale = true
+    })
+    page.on('download', (download) => {
+      const seq = ++tracked.lastSeq
+      void (async () => {
+        await mkdir(this.options.downloadDir, { recursive: true })
+        const path = join(this.options.downloadDir, `${Date.now()}-${++this.downloadCounter}-${download.suggestedFilename()}`)
+        await download.saveAs(path)
+        this.record(tracked, { seq, path })
+      })().catch((err: unknown) => {
+        this.record(tracked, { seq, error: err instanceof Error ? err.message : String(err) })
+      })
     })
     this.pages.set(id, tracked)
     this.lastId = id
@@ -203,6 +240,11 @@ export class Engine {
     if (browser) await browser.close().catch(() => { /* process already exited; disposal is complete either way */ })
   }
 
+  private record(tracked: TrackedPage, entry: DownloadEntry): void {
+    if (tracked.downloads.length >= this.options.maxConsoleMessages) tracked.downloads.shift()
+    tracked.downloads.push(entry)
+  }
+
   private capture(tracked: TrackedPage, level: string, text: string): void {
     if (tracked.console.length >= this.options.maxConsoleMessages) tracked.console.shift()
     tracked.lastSeq += 1
@@ -231,7 +273,7 @@ export class Engine {
         : { headless: this.options.headless, channel }
       try {
         if (this.options.profileDir !== '') {
-          context = await chromium.launchPersistentContext(this.options.profileDir, { ...launchOptions, viewport })
+          context = await chromium.launchPersistentContext(this.options.profileDir, { ...launchOptions, viewport, acceptDownloads: true })
           if (this.disposed) {
             await context.close().catch(() => { /* dispose raced the launch; close is best-effort */ })
             throw new Error('browser engine is disposed (plugin unloading)')
@@ -244,7 +286,7 @@ export class Engine {
             throw new Error('browser engine is disposed (plugin unloading)')
           }
           this.browser = browser
-          context = await browser.newContext({ viewport })
+          context = await browser.newContext({ viewport, acceptDownloads: true })
         }
         break
       } catch (err) {
@@ -276,6 +318,11 @@ export class Engine {
       await context.route('**/*', (route) => {
         const request = route.request()
         if (request.isNavigationRequest() && request.frame().parentFrame() === null) {
+          // A tab authorized under a prompt-free session carries its exemption
+          // for its own lifetime only; it never becomes a standing grant other
+          // sessions inherit.
+          const owner = this.tracked.get(request.frame().page())
+          if (owner?.unfenced) return route.continue()
           let url: URL
           try {
             url = new URL(request.url())

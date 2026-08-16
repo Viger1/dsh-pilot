@@ -13,8 +13,8 @@
  * @module dsh-pilot
  */
 
-import { mkdir, readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { mkdir, readFile, realpath, stat } from 'node:fs/promises'
+import { resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -69,6 +69,8 @@ export interface Config {
   profileDir: string
   /** Directory screenshots are written to, resolved against the working directory. */
   screenshotDir: string
+  /** Directory downloads are saved into, resolved against the working directory. */
+  downloadDir: string
   /** Maximum console messages retained per tab. */
   maxConsoleMessages: number
   /** Register the bundled `browser-pilot` skill when the skill seam is composed. */
@@ -91,32 +93,33 @@ export const Config: z<Config> = z.object({
   allowPasswordFields: z.boolean().default(false),
   profileDir: z.string().default(''),
   screenshotDir: z.string().default('.dsh-pilot'),
+  downloadDir: z.string().default('.dsh-pilot/downloads'),
   maxConsoleMessages: z.number().default(100),
   registerSkill: z.boolean().default(true),
 })
 
 /**
- * Whether the policy admits this URL (shared by the pre-flight gate and the
- * network fence).
+ * Whether the URL passes without asking anyone: local hosts, the configured
+ * allowlist, a session-granted origin, or the `allow` policy.
  * @param url - parsed navigation target.
  * @param config - deployment configuration.
- * @returns true when navigation may proceed.
+ * @param approvedOrigins - origins granted interactively this plugin lifetime.
+ * @returns true when navigation may proceed silently.
  */
-function originAllowed(url: URL, config: Config): boolean {
+function originAllowed(url: URL, config: Config, approvedOrigins: ReadonlySet<string>): boolean {
   return LOCAL_HOSTS.has(url.hostname)
     || config.allowedOrigins.includes(url.origin)
     || config.allowedOrigins.includes(url.hostname)
+    || approvedOrigins.has(url.origin)
     || config.newOriginPolicy === 'allow'
 }
 
 /**
- * Pre-flight origin gate for pilot_navigate: same policy as the network
- * fence, with a friendlier error than a blocked request.
+ * Parse and shape-check a navigation target.
  * @param target - the URL the model asked to open.
- * @param config - deployment configuration.
- * @returns the parsed URL when allowed.
+ * @returns the parsed http(s) URL.
  */
-function gateOrigin(target: string, config: Config): URL {
+function parseTarget(target: string): URL {
   let url: URL
   try {
     url = new URL(target)
@@ -126,12 +129,37 @@ function gateOrigin(target: string, config: Config): URL {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`protocol ${url.protocol} is not supported; pilot_navigate opens http(s) pages only`)
   }
-  if (originAllowed(url, config)) return url
-  const guidance = config.newOriginPolicy === 'deny'
-    ? 'This deployment denies new origins.'
-    : 'Interactive origin approval ships in M1; until then, ask the user to add the '
-      + 'hostname to the dsh-pilot `allowedOrigins` config or set `newOriginPolicy: allow`.'
-  throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed. ${guidance}`)
+  return url
+}
+
+/**
+ * The session's effective approval policy: the last `approval/policy` event
+ * in the log (the official fold — replaying the log IS the state), or
+ * undefined when the session never recorded one.
+ * @param events - session events in log order.
+ * @returns 'ask', 'never', or undefined.
+ */
+function sessionApprovalPolicy(events: readonly { type: string; data?: unknown }[]): 'ask' | 'never' | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type === 'approval/policy') {
+      const policy = (event.data as { policy?: unknown } | undefined)?.policy
+      return policy === 'never' ? 'never' : policy === 'ask' ? 'ask' : undefined
+    }
+  }
+  return undefined
+}
+
+/** The approval seam surface this plugin consumes (structural, optional service). */
+interface ApprovalLike {
+  config?: { policy?: string }
+  request(req: {
+    agent: unknown
+    toolName: string
+    callId?: unknown
+    reason?: string
+    signal?: AbortSignal
+  }): Promise<string>
 }
 
 /**
@@ -215,6 +243,72 @@ const TABS_SCHEMA = {
  * @param config - deployment configuration.
  */
 export function apply(ctx: Context, config: Config): void {
+  /** Origins granted through the approval seam; feeds the fence and the gate. */
+  const approvedOrigins = new Set<string>()
+
+  /** What authorizing a target implies for the tab that will load it. */
+  type Authorization = 'fenced' | 'unfenced'
+
+  const NO_CHANNEL_MESSAGE = 'no approval channel is available. Ask the user to add the hostname to the dsh-pilot `allowedOrigins` config.'
+
+  /**
+   * Authorize one navigation target, asking through the dsh approval seam
+   * when the session's stance calls for it.
+   *
+   * A session that opted out of prompts (approval policy `never`, the
+   * `danger-full-access` stance) is not re-gated by this plugin: its
+   * navigation is authorized and its tab runs unfenced for that tab's
+   * lifetime. That exemption deliberately does NOT enter `approvedOrigins`,
+   * because a plugin-lifetime grant would outlive the stance and silently
+   * unlock the origin for later `ask` sessions and for a parent agent whose
+   * subagents run prompt-free.
+   * @param url - parsed target.
+   * @param exec - the tool execution (agent, callId, signal).
+   * @returns whether the loading tab should bypass the network fence.
+   */
+  async function authorizeOrigin(url: URL, exec: { agent?: unknown; callId?: unknown; signal: AbortSignal }): Promise<Authorization> {
+    if (originAllowed(url, config, approvedOrigins)) return 'fenced'
+    if (config.newOriginPolicy === 'deny') {
+      throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed: this deployment denies new origins.`)
+    }
+    const approval = ctx.get('approval') as ApprovalLike | undefined
+    const agent = exec.agent as { session?: { events?: readonly { type: string; data?: unknown }[] } } | undefined
+    if (config.newOriginPolicy === 'auto' && exec.agent) {
+      // The user's stance, read from the session's own durable knobs. Asking
+      // a `never` session would auto-reject — the opposite of its intent.
+      const events = agent?.session?.events
+      const effective = (events ? sessionApprovalPolicy(events) : undefined)
+        ?? (approval?.config?.policy === 'never' ? 'never' : 'ask')
+      if (effective === 'never') return 'unfenced'
+    }
+    if (!approval || !exec.agent) {
+      throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed and ${NO_CHANNEL_MESSAGE}`)
+    }
+    const outcome = await approval.request({
+      agent: exec.agent,
+      toolName: 'pilot_navigate',
+      callId: exec.callId,
+      reason: `Navigate the pilot browser to ${url.origin} (outside the configured allowed origins).`,
+      signal: exec.signal,
+    })
+    if (outcome === 'allowed-once') {
+      approvedOrigins.add(url.origin)
+      return 'fenced'
+    }
+    // Distinguish a human "no" from an absent channel or a withdrawn
+    // question, so the model reacts to what actually happened.
+    if (outcome === 'rejected') {
+      throw new Error(
+        `origin ${JSON.stringify(url.origin)} was rejected by the user. `
+        + 'Respect the decision; do not retry this origin unless the user asks.',
+      )
+    }
+    if (outcome === 'cancelled') {
+      throw new Error(`the approval question for ${JSON.stringify(url.origin)} was cancelled before it was answered.`)
+    }
+    throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed and ${NO_CHANNEL_MESSAGE}`)
+  }
+
   assertPositive({
     viewportWidth: config.viewportWidth,
     viewportHeight: config.viewportHeight,
@@ -233,10 +327,12 @@ export function apply(ctx: Context, config: Config): void {
     maxConsoleMessages: config.maxConsoleMessages,
     maxTabs: config.maxTabs,
     profileDir: config.profileDir,
+    downloadDir: resolve(config.downloadDir),
     // With policy `allow` the fence is pointless overhead; every other policy
     // gets network-layer enforcement so redirects and link clicks cannot
-    // drift past the entry gate.
-    ...(config.newOriginPolicy === 'allow' ? {} : { originAllowed: (url: URL) => originAllowed(url, config) }),
+    // drift past the entry gate. Interactive grants join `approvedOrigins`
+    // and are thereby admitted here too.
+    ...(config.newOriginPolicy === 'allow' ? {} : { originAllowed: (url: URL) => originAllowed(url, config, approvedOrigins) }),
   })
   ctx.effect(() => async () => {
     await engine.dispose()
@@ -253,10 +349,11 @@ export function apply(ctx: Context, config: Config): void {
     description:
       'Drive the browser to a page: goto a URL (optionally in a new tab), or go '
       + 'back/forward/reload on the current tab. Local hosts are always allowed; other '
-      + 'origins pass the deployment\'s origin policy, enforced at the network layer '
-      + '(redirects and link-outs included). Returns load-time console errors and the '
-      + 'open-tab list. After every navigation, call pilot_snapshot before acting — '
-      + 'old refs are stale.',
+      + 'origins pass the deployment\'s origin policy — depending on the session\'s '
+      + 'permission stance this may ask the user for one-time approval — and the '
+      + 'decision is enforced at the network layer (redirects and link-outs included). '
+      + 'Returns load-time console errors and the open-tab list. After every '
+      + 'navigation, call pilot_snapshot before acting — old refs are stale.',
     // Budget covers the worst case: cold browser launch plus both navigation
     // attempts (load, then the domcontentloaded fallback).
     timeoutMs: 2 * config.navigationTimeoutMs + 30000,
@@ -299,9 +396,11 @@ export function apply(ctx: Context, config: Config): void {
       throwIfAborted(exec.signal)
       if (args.action === 'goto') {
         if (args.url === undefined) throw new Error('action `goto` requires `url`')
-        const url = gateOrigin(args.url, config)
+        const url = parseTarget(args.url)
+        const authorization = await authorizeOrigin(url, exec)
         const freshTab = args.newTab === true || engine.list().length === 0
         const tracked = freshTab ? await engine.newTab() : engine.get(args.pageId)
+        if (authorization === 'unfenced') tracked.unfenced = true
         let seqBefore = tracked.lastSeq
         // Closing the page is what actually interrupts an in-flight goto when
         // the tool execution is cancelled.
@@ -394,9 +493,9 @@ export function apply(ctx: Context, config: Config): void {
     name: 'pilot_act',
     description:
       'Act on a ref from the latest pilot_snapshot: click, type (fills text), press a '
-      + 'key, hover, select a combobox option, or check/uncheck. Refs go stale after '
-      + 'any navigation — re-snapshot first. Returns console errors the action caused '
-      + 'and whether it navigated.',
+      + 'key, hover, select a combobox option, check/uncheck, or upload workspace '
+      + 'files to a file input. Refs go stale after any navigation — re-snapshot '
+      + 'first. Returns console errors the action caused and whether it navigated.',
     // Budget covers the password probe plus the action, each actionTimeoutMs.
     timeoutMs: 2 * config.actionTimeoutMs + 10000,
     parameters: {
@@ -404,12 +503,17 @@ export function apply(ctx: Context, config: Config): void {
       action: {
         type: 'string',
         required: true,
-        enum: ['click', 'type', 'press', 'hover', 'select', 'check', 'uncheck'],
-        description: 'click | type (needs text) | press (needs key) | hover | select (needs option) | check | uncheck.',
+        enum: ['click', 'type', 'press', 'hover', 'select', 'check', 'uncheck', 'upload'],
+        description: 'click | type (needs text) | press (needs key) | hover | select (needs option) | check | uncheck | upload (needs files, targets a file input).',
       },
       text: { type: 'string', description: 'Text for `type`.' },
       key: { type: 'string', description: 'Key for `press`, e.g. Enter, Escape, ArrowDown.' },
       option: { type: 'string', description: 'Visible option label for `select`.' },
+      files: {
+        type: 'array',
+        description: 'Workspace-relative file paths for `upload`.',
+        items: { type: 'string' },
+      },
       pageId: { type: 'string', description: 'Tab to act on; defaults to the current tab.' },
     },
     output: {
@@ -427,13 +531,29 @@ export function apply(ctx: Context, config: Config): void {
             description: 'Console errors raised by this action (up to 10).',
             items: { type: 'string' },
           },
+          downloads: {
+            type: 'array',
+            required: true,
+            description: 'Downloads this action produced: saved path, or the failure reason.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string' },
+                error: { type: 'string' },
+              },
+            },
+          },
         },
       },
       render: (_args, value) => [{
         type: 'text',
         text: `${value.action} on ${value.target} done.`
           + (value.navigated ? ` Page navigated to ${value.url} — refs are stale, snapshot again.` : '')
-          + (value.newErrors.length === 0 ? ' No new console errors.' : `\nNew console errors:\n${value.newErrors.join('\n')}`),
+          + (value.newErrors.length === 0 ? ' No new console errors.' : `\nNew console errors:\n${value.newErrors.join('\n')}`)
+          + (value.downloads.length === 0
+            ? ''
+            : '\n' + value.downloads.map(d => d.path ? `[download] saved to ${d.path}` : `[download] failed: ${d.error ?? 'unknown'}`).join('\n')),
       }],
     },
     async execute(args, exec) {
@@ -483,12 +603,37 @@ export function apply(ctx: Context, config: Config): void {
       } else if (args.action === 'select') {
         if (args.option === undefined) throw new Error('action `select` requires `option`')
         await raceAbort(exec.signal, locator.selectOption({ label: args.option }, { timeout }))
+      } else if (args.action === 'upload') {
+        if (args.files === undefined || args.files.length === 0) throw new Error('action `upload` requires `files`')
+        // Canonicalize both sides before comparing: a lexical check passes a
+        // workspace symlink pointing at host files, and setInputFiles would
+        // then read the real target.
+        const workspace = await realpath(process.cwd())
+        const prefix = workspace.endsWith(sep) ? workspace : workspace + sep
+        const resolved: string[] = []
+        for (const file of args.files) {
+          const real = await realpath(resolve(workspace, file)).catch(() => {
+            throw new Error(`upload refused: ${JSON.stringify(file)} does not exist`)
+          })
+          if (!real.startsWith(prefix)) {
+            throw new Error(`upload refused: ${JSON.stringify(file)} resolves outside the workspace`)
+          }
+          const info = await stat(real)
+          if (!info.isFile()) {
+            throw new Error(`upload refused: ${JSON.stringify(file)} is not a regular file`)
+          }
+          resolved.push(real)
+        }
+        await raceAbort(exec.signal, locator.setInputFiles(resolved, { timeout }))
       } else if (args.action === 'check') {
         await raceAbort(exec.signal, locator.check({ timeout }))
       } else {
         await raceAbort(exec.signal, locator.uncheck({ timeout }))
       }
       // Give handlers a tick to run so their console errors are captured.
+      // Downloads settle asynchronously: an upload/click that starts one is
+      // reported here when it lands within the tick, otherwise by the next
+      // tool call that reads past this seq.
       await tracked.page.waitForTimeout(100)
       return {
         action: args.action,
@@ -499,6 +644,9 @@ export function apply(ctx: Context, config: Config): void {
           .filter(entry => entry.seq > seqBefore && entry.level === 'error')
           .map(entry => entry.text)
           .slice(0, 10),
+        downloads: tracked.downloads
+          .filter(entry => entry.seq > seqBefore)
+          .map(entry => entry.path !== undefined ? { path: entry.path } : { error: entry.error ?? 'unknown' }),
       }
     },
     presentCall: args => ({
