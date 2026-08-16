@@ -8,7 +8,7 @@
  * so a text-only model operates real pages without vision, CSS selectors, or
  * order-sensitive reconstruction. Local hosts work out of the box; other
  * origins pass a network-layer fence that also covers redirects, link clicks,
- * and history moves (dsh approval-seam integration lands in M1).
+ * and history moves; the origin policy follows the dsh session's own approval stance.
  * Named exports preserve loader injection metadata.
  * @module dsh-pilot
  */
@@ -27,12 +27,18 @@ import {
 } from '@deepseek-ai/dsh-skill'
 import { Engine, raceAbort, throwIfAborted, type TrackedPage } from './engine.js'
 import { buildSnapshot, isRefShaped } from './snapshot.js'
+import {
+  assertPositive,
+  decideAuthorization,
+  mapBlockedError,
+  originAllowed,
+  parseTarget,
+  refusalMessage,
+  sessionApprovalPolicy,
+} from './policy.js'
 
 export const name = 'pilot'
 export const inject = ['tools']
-
-/** Hosts reachable without any configuration; local work is the core use. */
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 /** Deployment configuration; every tunable is a cordis.yml field. */
 export interface Config {
@@ -57,9 +63,8 @@ export interface Config {
   /** Origins (or bare hostnames) pilot_navigate may always visit. */
   allowedOrigins: string[]
   /**
-   * Policy for origins outside `allowedOrigins` and local hosts:
-   * `auto` follows the dsh session's permission stance (M1; refuses in M0),
-   * `ask` requests interactive approval (M1; refuses in M0),
+   * Policy for origins outside `allowedOrigins` and local hosts: `auto`
+   * follows the session's approval stance, `ask` always requests approval,
    * `deny` refuses, `allow` passes silently and disables the network fence.
    */
   newOriginPolicy: 'auto' | 'ask' | 'deny' | 'allow'
@@ -98,58 +103,6 @@ export const Config: z<Config> = z.object({
   registerSkill: z.boolean().default(true),
 })
 
-/**
- * Whether the URL passes without asking anyone: local hosts, the configured
- * allowlist, a session-granted origin, or the `allow` policy.
- * @param url - parsed navigation target.
- * @param config - deployment configuration.
- * @param approvedOrigins - origins granted interactively this plugin lifetime.
- * @returns true when navigation may proceed silently.
- */
-function originAllowed(url: URL, config: Config, approvedOrigins: ReadonlySet<string>): boolean {
-  return LOCAL_HOSTS.has(url.hostname)
-    || config.allowedOrigins.includes(url.origin)
-    || config.allowedOrigins.includes(url.hostname)
-    || approvedOrigins.has(url.origin)
-    || config.newOriginPolicy === 'allow'
-}
-
-/**
- * Parse and shape-check a navigation target.
- * @param target - the URL the model asked to open.
- * @returns the parsed http(s) URL.
- */
-function parseTarget(target: string): URL {
-  let url: URL
-  try {
-    url = new URL(target)
-  } catch {
-    throw new Error(`target ${JSON.stringify(target)} is not an absolute URL (http/https only)`)
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`protocol ${url.protocol} is not supported; pilot_navigate opens http(s) pages only`)
-  }
-  return url
-}
-
-/**
- * The session's effective approval policy: the last `approval/policy` event
- * in the log (the official fold — replaying the log IS the state), or
- * undefined when the session never recorded one.
- * @param events - session events in log order.
- * @returns 'ask', 'never', or undefined.
- */
-function sessionApprovalPolicy(events: readonly { type: string; data?: unknown }[]): 'ask' | 'never' | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
-    if (event.type === 'approval/policy') {
-      const policy = (event.data as { policy?: unknown } | undefined)?.policy
-      return policy === 'never' ? 'never' : policy === 'ask' ? 'ask' : undefined
-    }
-  }
-  return undefined
-}
-
 /** The approval seam surface this plugin consumes (structural, optional service). */
 interface ApprovalLike {
   config?: { policy?: string }
@@ -160,36 +113,6 @@ interface ApprovalLike {
     reason?: string
     signal?: AbortSignal
   }): Promise<string>
-}
-
-/**
- * Translate a fence-blocked navigation failure into policy guidance.
- * @param err - the raw playwright error.
- * @returns the error to surface.
- */
-function mapBlockedError(err: unknown): Error {
-  const message = err instanceof Error ? err.message : String(err)
-  if (message.includes('ERR_BLOCKED_BY_CLIENT')) {
-    return new Error(
-      'navigation blocked by the origin fence (a redirect or in-page navigation '
-      + 'left the allowed origins). Ask the user to extend `allowedOrigins` if this '
-      + 'destination is legitimate.',
-    )
-  }
-  return err instanceof Error ? err : new Error(message)
-}
-
-/**
- * Reject non-positive numeric config at load, so misconfiguration fails loud
- * instead of surfacing as confusing playwright timeouts.
- * @param fields - config field name → value.
- */
-function assertPositive(fields: Record<string, number>): void {
-  for (const [field, value] of Object.entries(fields)) {
-    if (!Number.isInteger(value) || value <= 0) {
-      throw new Error(`dsh-pilot config ${field} must be a positive integer, got ${value}`)
-    }
-  }
 }
 
 /** Canonical pilot_navigate result. */
@@ -249,42 +172,27 @@ export function apply(ctx: Context, config: Config): void {
   /** What authorizing a target implies for the tab that will load it. */
   type Authorization = 'fenced' | 'unfenced'
 
-  const NO_CHANNEL_MESSAGE = 'no approval channel is available. Ask the user to add the hostname to the dsh-pilot `allowedOrigins` config.'
-
   /**
-   * Authorize one navigation target, asking through the dsh approval seam
-   * when the session's stance calls for it.
-   *
-   * A session that opted out of prompts (approval policy `never`, the
-   * `danger-full-access` stance) is not re-gated by this plugin: its
-   * navigation is authorized and its tab runs unfenced for that tab's
-   * lifetime. That exemption deliberately does NOT enter `approvedOrigins`,
-   * because a plugin-lifetime grant would outlive the stance and silently
-   * unlock the origin for later `ask` sessions and for a parent agent whose
-   * subagents run prompt-free.
+   * Authorize one navigation target: {@link decideAuthorization} owns the
+   * rules, this performs the interactive question the `ask` decision calls for.
    * @param url - parsed target.
    * @param exec - the tool execution (agent, callId, signal).
    * @returns whether the loading tab should bypass the network fence.
    */
   async function authorizeOrigin(url: URL, exec: { agent?: unknown; callId?: unknown; signal: AbortSignal }): Promise<Authorization> {
-    if (originAllowed(url, config, approvedOrigins)) return 'fenced'
-    if (config.newOriginPolicy === 'deny') {
-      throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed: this deployment denies new origins.`)
-    }
     const approval = ctx.get('approval') as ApprovalLike | undefined
     const agent = exec.agent as { session?: { events?: readonly { type: string; data?: unknown }[] } } | undefined
-    if (config.newOriginPolicy === 'auto' && exec.agent) {
-      // The user's stance, read from the session's own durable knobs. Asking
-      // a `never` session would auto-reject — the opposite of its intent.
-      const events = agent?.session?.events
-      const effective = (events ? sessionApprovalPolicy(events) : undefined)
-        ?? (approval?.config?.policy === 'never' ? 'never' : 'ask')
-      if (effective === 'never') return 'unfenced'
-    }
-    if (!approval || !exec.agent) {
-      throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed and ${NO_CHANNEL_MESSAGE}`)
-    }
-    const outcome = await approval.request({
+    const events = agent?.session?.events
+    const decision = decideAuthorization(url, config, approvedOrigins, {
+      approvalPolicy: (events ? sessionApprovalPolicy(events) : undefined)
+        ?? (approval?.config?.policy === 'never' ? 'never' : 'ask'),
+      hasApprovalService: approval !== undefined,
+      hasAgent: exec.agent !== undefined,
+    })
+    if (decision.kind === 'allow') return 'fenced'
+    if (decision.kind === 'allow-unfenced') return 'unfenced'
+    if (decision.kind === 'deny') throw new Error(decision.reason)
+    const outcome = await approval!.request({
       agent: exec.agent,
       toolName: 'pilot_navigate',
       callId: exec.callId,
@@ -295,18 +203,7 @@ export function apply(ctx: Context, config: Config): void {
       approvedOrigins.add(url.origin)
       return 'fenced'
     }
-    // Distinguish a human "no" from an absent channel or a withdrawn
-    // question, so the model reacts to what actually happened.
-    if (outcome === 'rejected') {
-      throw new Error(
-        `origin ${JSON.stringify(url.origin)} was rejected by the user. `
-        + 'Respect the decision; do not retry this origin unless the user asks.',
-      )
-    }
-    if (outcome === 'cancelled') {
-      throw new Error(`the approval question for ${JSON.stringify(url.origin)} was cancelled before it was answered.`)
-    }
-    throw new Error(`origin ${JSON.stringify(url.origin)} is not allowed and ${NO_CHANNEL_MESSAGE}`)
+    throw new Error(refusalMessage(url.origin, outcome))
   }
 
   assertPositive({
