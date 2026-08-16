@@ -20,11 +20,12 @@
 | `pilot_screenshot` | 与 dsh-preview 同款（给人看的证据）。 |
 | `pilot_close` | 关闭标签页/会话。 |
 
-### ref 机制
+### ref 机制（M0 审查后换底）
 
-- 每次 `pilot_snapshot` 生成一代引用表：`ref-N → (role, accessible name, nth)` 定位器映射，存在 TrackedPage 上。
-- 导航或新 snapshot 使旧代引用失效；`pilot_act` 拿到过期 ref 返回结构化错误："refs are stale, call pilot_snapshot again"——把重新观察的纪律编码进错误信息。
-- 无障碍名缺失的元素回退到 `nth-of-role` 定位并在 snapshot 里标注，提示模型优先选有名字的元素。
+- 初版设计的 `(role, name, nth)` 重建机制被审查实机证伪：ariaSnapshot 的树序与 `getByRole` 的 DOM 枚举序在 shadow DOM / aria-owns 页面上不一致，会**静默点错同名元素**（critical，已复现）。
+- 现行机制：`page.ariaSnapshot({ mode: 'ai' })`（1.62 起的公开受校验选项）直接输出绑定到具体元素的 `[ref=eN]` 标记，`pilot_act` 经 `aria-ref=<ref>` 选择器引擎解析——与 playwright-mcp 生产环境同款，天然覆盖 shadow DOM 与同源 iframe（iframe 内 ref 形如 `f1e3`），顺序漂移类缺陷整族消失。
+- 导航后旧 ref 由引擎硬性失效（解析报错）；插件另维护 `refsStale` 预检把"重新快照"的纪律写进更友好的错误信息。快照按字符预算在**行边界**截断，被截掉的 ref 不计入 refCount。
+- playwright-core 固定到 `~1.62.0`（`mode: 'ai'` 的行为随小版本演进，升级需回归 shadow DOM/iframe 用例）。
 
 ## 3. 权限模型（本插件的核心卖点）
 
@@ -32,6 +33,7 @@
 
 设计前提（已核实官方语义，`packages/interaction/user-approval/README.md`）：审批策略 `never`（`danger-full-access` 预设自带）的含义是**"不弹窗，需审批动作自动拒绝"**。因此域名检查不能无脑走 ask 通道——在全开权限模式下会被自动拒绝，恰好与用户意图相反。
 
+0. **网络层围栏（原计划 M1，审查后提前到 M0 落地）**：非 `allow` 策略下，引擎在浏览器 context 上安装请求拦截器，对所有 http(s) **主框架文档请求**执行同一 origin 谓词——重定向、页内链接点击、back/forward、meta refresh 一律在网络层被拦断（`ERR_BLOCKED_BY_CLIENT` 映射为策略指引错误），入口门（`pilot_navigate` 的预检）只是更友好的第一道提示。`window.open`/`target=_blank` 弹窗一律即刻关闭（不进 tab 注册表、不受工具管控的页面不允许存在）。`allow` 策略跳过整套围栏（零开销）。
 1. **默认 `newOriginPolicy: auto`，跟随 dsh 会话权限**：
    - 会话为 `danger-full-access`（审批 `never`）→ 任何 origin **静默放行**。用户已声明全开权限，插件不再设卡。
    - 会话审批策略为 `ask` 且审批座席在场 → 新 origin 弹标准审批卡（`tools/pre-execute` 返回 `ask`，由 `user-approval` 服务）；同会话批准过的 origin 进入插件级缓存不重复问。
@@ -70,9 +72,9 @@
 
 ## 6. 里程碑
 
-- **M0（可演示）**：引擎移植 + navigate/snapshot/act/wait 四件套 + 隔离 context。demo：让 agent 在本地起的表单页上完成"填表 → 提交 → 断言成功提示"。
-- **M1（可发布）**：审批集成（tools/pre-execute + user-approval）、标签页、upload/download、skill、双语 README、审查工作流过一遍、e2e 实测。
-- **M2（差异化拉满）**：与 dsh-preview v1.1 共享的视觉路由（截图→用户配置的视觉模型route），用于 canvas/图表类无 DOM 语义的页面兜底。
+- **M0（已完成，2026-08-16）**：aria-ref 快照/操作机制、navigate/snapshot/act/wait/screenshot/close 六工具、标签页、网络层 origin 围栏 + 弹窗封禁、密码闸、browser-pilot 技能、持久 profile 选项。34-agent 审查 → 24 条确认全部修复（2 条经实机复现的 ref 机制缺陷促成换底）；e2e：agent 全自主完成表单流程。
+- **M1（可发布）**：审批集成（`auto` 策略读取会话 `sandbox/mode`/`approval/policy`，接 tools/pre-execute + user-approval）、upload/download、双语 README、发布流程。
+- **M2（差异化拉满）**：与 dsh-preview v1.1 共享的视觉路由（截图→用户配置的视觉模型 route），用于 canvas/图表类无 DOM 语义的页面兜底。
 
 ## 7. 评审决议（2026-08-16，与维护者讨论定案）
 
