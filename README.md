@@ -10,7 +10,25 @@ Your dsh agent can already see pages ([dsh-preview](https://github.com/Viger1/ds
 
 Real, unedited runs from a headless dsh agent (DeepSeek-V4-Pro):
 
-**Form flow, fully autonomous** — navigate → snapshot (`textbox "用户名" [ref=e5]`, `button "提交注册" [ref=e12]`, ...) → fill by ref → select an option → check a box → submit → `pilot_wait` for the success text (hit in 5ms) → screenshot → close. Zero console errors, zero selectors written.
+**Form flow, fully autonomous.** This is what `pilot_snapshot` actually returns for a registration page — the agent's entire view of it:
+
+```
+- heading "用户注册" [level=1] [ref=e2]
+- generic [ref=e3]:
+  - text: 用户名
+  - textbox "用户名" [ref=e5]
+  - text: 邮箱
+  - textbox "邮箱" [ref=e7]
+  - text: 套餐
+  - combobox "套餐" [ref=e9]:
+    - option "免费版" [selected]
+    - option "专业版"
+  - checkbox "同意服务条款" [ref=e11]
+  - button "提交注册" [ref=e12]
+  - button "重置" [ref=e13]
+```
+
+From there: fill `e5` and `e7`, select 专业版 on `e9`, check `e11`, click `e12`, `pilot_wait` for the success text (hit in 5ms), screenshot, close. Zero console errors, zero selectors written, no vision model in the loop.
 
 **Permissions that follow the session** — the same agent asked to open `https://example.com`:
 - under the default `workspace-write` session: refused — the approval chain answered `unavailable` and the agent was told exactly what config to request;

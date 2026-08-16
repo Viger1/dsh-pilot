@@ -10,7 +10,25 @@
 
 来自 headless dsh agent（DeepSeek-V4-Pro）的真实未剪辑运行：
 
-**全自主表单流程** —— 导航 → 快照（`textbox "用户名" [ref=e5]`、`button "提交注册" [ref=e12]`…）→ 按 ref 填表 → 选下拉项 → 勾选 → 提交 → `pilot_wait` 等成功提示（5ms 命中）→ 截图 → 关标签页。零控制台错误，零手写选择器。
+**全自主表单流程。** 下面是 `pilot_snapshot` 对一个注册页面的真实返回——也就是 agent 看到的全部内容：
+
+```
+- heading "用户注册" [level=1] [ref=e2]
+- generic [ref=e3]:
+  - text: 用户名
+  - textbox "用户名" [ref=e5]
+  - text: 邮箱
+  - textbox "邮箱" [ref=e7]
+  - text: 套餐
+  - combobox "套餐" [ref=e9]:
+    - option "免费版" [selected]
+    - option "专业版"
+  - checkbox "同意服务条款" [ref=e11]
+  - button "提交注册" [ref=e12]
+  - button "重置" [ref=e13]
+```
+
+接下来：填 `e5` 与 `e7`、在 `e9` 上选「专业版」、勾选 `e11`、点击 `e12`、`pilot_wait` 等成功提示（5ms 命中）、截图、关标签页。零控制台错误，零手写选择器，全程没有视觉模型参与。
 
 **权限跟随会话** —— 同一个 agent 尝试打开 `https://example.com`：
 - 默认 `workspace-write` 会话下：被拒——审批链返回 `unavailable`，agent 被明确告知该请用户加什么配置；
