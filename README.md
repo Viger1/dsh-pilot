@@ -110,6 +110,7 @@ Refs come from playwright's engine-bound accessibility snapshots (`aria-ref` loc
 | [dsh-preview](https://github.com/Viger1/dsh-preview) | 👁 Eyes — verify what it builds: open, read, screenshot, self-check |
 | **dsh-pilot** (this repo) | ✋ Hands — operate any page by accessibility refs, with a native permission model |
 | [dsh-review](https://github.com/Viger1/dsh-review) | 🔍 Judgement — find defects, then try to refute each one before reporting it |
+| [dsh-design](https://github.com/Viger1/dsh-design) | 🎨 Taste — constrain the choices, then measure whether the result kept them |
 
 Each installs independently and they coexist. Design rationale and milestones: [DESIGN.md](DESIGN.md).
 
