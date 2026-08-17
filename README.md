@@ -2,9 +2,11 @@
 
 English | [中文](README.zh.md)
 
-**Hands for your DeepSeek Harness agent — autonomous browser operation with a native permission model.**
+**Browser automation whose permission model is the dsh session's, enforced at the network layer.**
 
-Your dsh agent can already see pages ([dsh-preview](https://github.com/Viger1/dsh-preview)); `dsh-pilot` lets it *drive* them: navigate, read any page as a numbered accessibility tree, act on elements by ref, wait for conditions, upload files, and test complete flows — all without vision, CSS-selector guessing, or a second model. Built for text-only models: the page IS text.
+Plenty of plugins let a dsh agent drive a browser, and most of them read the page as an accessibility tree — that part is the ecosystem norm, not a feature. What none of them do is answer *where the agent is allowed to go* with anything sturdier than a check at the tool-call entry point, which by construction cannot stop a redirect, an in-page link click, or a back/forward move.
+
+`dsh-pilot` answers it twice: the policy is **read from the session's own approval stance** rather than invented by the plugin, and it is **enforced by request interception on the browser context**, so every main-frame navigation passes it however it started.
 
 ## What it looks like
 
@@ -34,7 +36,7 @@ From there: fill `e5` and `e7`, select 专业版 on `e9`, check `e11`, click `e1
 - under the default `workspace-write` session: refused — the approval chain answered `unavailable` and the agent was told exactly what config to request;
 - under `danger-full-access` (the user opted out of prompts): opens silently, no gate in the way.
 
-That is the design: **the plugin never invents a second permission system.** It reads the dsh session's own durable permission events and behaves accordingly.
+That is the design: **the plugin never invents a second permission system.** It reads the dsh session's own durable permission events and behaves accordingly — and because the decision lives in a request interceptor rather than a pre-execute hook, a page that redirects or links its way somewhere else does not slip past it.
 
 ## Install
 
@@ -55,7 +57,7 @@ Uses your installed Google Chrome / Microsoft Edge automatically; otherwise run 
 | `pilot_screenshot` | Viewport or full-page PNG into the workspace, for the human. |
 | `pilot_close` | Close tabs when done. |
 
-Refs come from playwright's engine-bound accessibility snapshots (`aria-ref` locators — the same mechanism playwright-mcp uses in production), so snapshot order can never misdirect an action. Stale refs are refused with instructions to re-snapshot.
+Refs come from playwright's engine-bound accessibility snapshots, so snapshot order can never misdirect an action, and stale refs are refused with instructions to re-snapshot. This mechanism is **standard practice** across agent browser tooling rather than something this plugin invented — see [Known limitations](#known-limitations) for the maintenance cost it carries.
 
 ## The permission model
 
@@ -101,7 +103,8 @@ Refs come from playwright's engine-bound accessibility snapshots (`aria-ref` loc
 - Approved origins accumulate for the plugin instance's lifetime and are shared across sessions of one dsh process (one shared browser context).
 - Canvas-rendered content has no accessibility semantics; `pilot_screenshot` shows it to the human, and screenshot→vision-model routing is on the roadmap.
 - Headless rendering differs from a desktop browser (pointer lock, some GPU paths, OS dialogs).
-- playwright-core is pinned to `~1.62.0`: the ref-bearing snapshot mode is validated per minor version before upgrading.
+- **Part of the ref mechanism is Playwright-internal.** `ariaSnapshot({ mode: 'ai' })` is public and documented, but the `aria-ref=` selector engine that turns a ref back into a locator is not, and the related `Locator.ariaRef()` was removed in Playwright 1.60. `playwright-core` is therefore pinned to `~1.62.0` and each minor bump is re-validated against shadow-DOM and iframe cases. Treat this as an ongoing maintenance cost, not a settled foundation.
+- **The name is not unique.** [guo6x/dsh-pilot](https://github.com/guo6x/dsh-pilot) is a different, older plugin in the same space, installed via `github:guo6x/dsh-pilot`. This one is the npm package `dsh-pilot`. Check which you have before filing an issue against either.
 
 ## Family
 
