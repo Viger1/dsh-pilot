@@ -120,19 +120,29 @@ export class Engine {
 
   /**
    * Open a new tab (without navigating). Enforces the tab limit.
+   *
+   * A cold first call launches the browser, which takes seconds; passing the
+   * caller's signal is what lets a cancellation during that window take effect
+   * instead of being noticed only once the page already exists.
+   * @param signal - cooperative cancellation from the tool execution.
    * @returns the tracked tab, already registered as the current tab.
    */
-  async newTab(): Promise<TrackedPage> {
+  async newTab(signal?: AbortSignal): Promise<TrackedPage> {
+    // Read through a call, not a captured value: `aborted` flips while these
+    // awaits are pending, which a narrowed property read would not observe.
+    const cancelled = (): boolean => signal !== undefined && signal.aborted
     this.throwIfDisposed()
+    if (cancelled()) throw new Error('cancelled before the tab was opened')
     if (this.pages.size >= this.options.maxTabs) {
       throw new Error(`tab limit reached (${this.options.maxTabs}); close a tab with pilot_close first`)
     }
     const context = await this.ensureContext()
     this.throwIfDisposed()
+    if (cancelled()) throw new Error('cancelled while the browser was starting')
     const page = await context.newPage()
-    if (this.disposed) {
-      await page.close().catch(() => { /* dispose raced the open; close is best-effort */ })
-      throw new Error('browser engine is disposed (plugin unloading)')
+    if (this.disposed || cancelled()) {
+      await page.close().catch(() => { /* dispose or abort raced the open; close is best-effort */ })
+      throw new Error(this.disposed ? 'browser engine is disposed (plugin unloading)' : 'cancelled before the tab was opened')
     }
     const id = `tab-${++this.counter}`
     const tracked: TrackedPage = { id, page, console: [], failures: [], lastSeq: 0, downloads: [], snapshotTaken: false, refsStale: false, unfenced: false }

@@ -296,7 +296,7 @@ export function apply(ctx: Context, config: Config): void {
         const url = parseTarget(args.url)
         const authorization = await authorizeOrigin(url, exec)
         const freshTab = args.newTab === true || engine.list().length === 0
-        const tracked = freshTab ? await engine.newTab() : engine.get(args.pageId)
+        const tracked = freshTab ? await engine.newTab(exec.signal) : engine.get(args.pageId)
         if (authorization === 'unfenced') tracked.unfenced = true
         let seqBefore = tracked.lastSeq
         // Closing the page is what actually interrupts an in-flight goto when
