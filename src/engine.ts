@@ -15,6 +15,9 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Browser, BrowserContext, Page } from 'playwright-core'
 import { chromium } from 'playwright-core'
+import { withCancellation, type CancellationScope } from './cancellation.js'
+
+export { raceAbort, throwIfAborted, withCancellation } from './cancellation.js'
 
 /** Longest console message text retained; the tail is dropped, not the entry. */
 const MAX_CONSOLE_TEXT = 2000
@@ -348,32 +351,4 @@ export class Engine {
     }
     return context
   }
-}
-
-/**
- * Throw when the signal is already aborted.
- * @param signal - the tool execution's cancellation signal.
- */
-export function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw new Error('cancelled before the browser step started')
-}
-
-/**
- * Settle `work` or reject as soon as `signal` aborts, whichever happens first.
- * The underlying operation keeps its own playwright timeout as the hard bound;
- * this race is what lets a tool return promptly on cooperative cancellation.
- * @param signal - the tool execution's cancellation signal.
- * @param work - the in-flight browser operation.
- * @returns the settled value of `work`.
- */
-export function raceAbort<T>(signal: AbortSignal, work: Promise<T>): Promise<T> {
-  if (signal.aborted) return Promise.reject(new Error('cancelled before the browser step started'))
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error('cancelled by tool signal'))
-    signal.addEventListener('abort', onAbort, { once: true })
-    work.then(
-      (value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
-      (err: unknown) => { signal.removeEventListener('abort', onAbort); reject(err instanceof Error ? err : new Error(String(err))) },
-    )
-  })
 }
