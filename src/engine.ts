@@ -269,11 +269,44 @@ export class Engine {
   }
 
   private ensureContext(): Promise<BrowserContext> {
-    this.contextPromise ??= this.launchContext().catch((err: unknown) => {
-      this.contextPromise = undefined
-      throw err
-    })
+    if (this.contextPromise === undefined) {
+      // Keep the promise in a local so the handlers below can tell whether it is
+      // still the current one: a relaunch installs a fresh promise, and a stale
+      // handler must never clear that newer one.
+      const promise = this.launchContext().catch((err: unknown) => {
+        if (this.contextPromise === promise) this.contextPromise = undefined
+        throw err
+      })
+      this.contextPromise = promise
+      void promise.then(
+        (context) => this.watchContext(context, promise),
+        () => { /* launch failure already cleared the promise above */ },
+      )
+    }
     return this.contextPromise
+  }
+
+  /**
+   * Drop every cached handle when the browser context closes underneath us: the
+   * user closed the window, or the browser process died. Without this the cached
+   * `contextPromise` keeps handing back a dead context, so every later tool call
+   * fails with "Target page, context or browser has been closed" and only a
+   * plugin reload brings the browser back. Clearing the cache makes the next
+   * call relaunch instead.
+   * @param context - the context that just started.
+   * @param promise - the promise that produced it, used to detect a stale close.
+   */
+  private watchContext(context: BrowserContext, promise: Promise<BrowserContext>): void {
+    context.on('close', () => {
+      if (this.contextPromise === promise) this.contextPromise = undefined
+      if (this.persistent === context) this.persistent = undefined
+      if (this.browser !== undefined && context.browser() === this.browser) this.browser = undefined
+      // The tabs registered against the dead context can never be used again;
+      // ids are reissued from a fresh counter window, so drop them entirely.
+      this.pages.clear()
+      this.tracked = new WeakMap()
+      this.lastId = undefined
+    })
   }
 
   private async launchContext(): Promise<BrowserContext> {
